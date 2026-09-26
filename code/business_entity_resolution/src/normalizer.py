@@ -1,7 +1,7 @@
 """
-Multilingual Text & Address Normalizer for Large-Scale Entity Resolution.
+Enhanced Multilingual Normalizer with Geographic Extraction & Acronym Generation.
 Supports Indic script phonetization, French accent folding, legal suffix isolation,
-and zero-stripped address number extraction.
+postal code extraction, state normalization, and acronym generation.
 """
 
 import re
@@ -9,9 +9,9 @@ import unicodedata
 
 # 1. Unified Indic transliteration table (Brahmi relative Unicode offset structure)
 INDIC_BLOCKS = [
-    (0x0900, 0x097F), # Devanagari (Hindi, Marathi, Sanskrit)
-    (0x0980, 0x09FF), # Bengali / Assamese
-    (0x0A00, 0x0A7F), # Gurmukhi (Punjabi)
+    (0x0900, 0x097F), # Devanagari
+    (0x0980, 0x09FF), # Bengali
+    (0x0A00, 0x0A7F), # Gurmukhi
     (0x0A80, 0x0AFF), # Gujarati
     (0x0B00, 0x0B7F), # Oriya
     (0x0B80, 0x0BFF), # Tamil
@@ -35,12 +35,12 @@ OFFSET_MAP = {
     0x4D: "" # Virama
 }
 
-# 2. Comprehensive Legal Suffixes across US, India, and France
+# 2. Comprehensive Legal Suffixes
 LEGAL_SUFFIXES = {
     # US
     "llc", "inc", "corp", "corporation", "company", "co", "ltd", "limited", "incorporated",
     # India
-    "pvt", "private", "llp", "traders", "enterprises", "enterprise", "industries", "services",
+    "pvt", "private", "llp", "traders", "enterprises", "enterprise", "industries", "services", "service",
     # France
     "sarl", "sasu", "sas", "eurl", "sci", "sa", "gmbh", "cie", "fils", "freres"
 }
@@ -52,9 +52,35 @@ GENERIC_STOPWORDS = {
     "allée", "allee", "chemin", "impasse"
 }
 
+# 3. Geographic States & Abbreviations (US & India)
+US_STATES = {
+    "al": "alabama", "ak": "alaska", "az": "arizona", "ar": "arkansas", "ca": "california",
+    "co": "colorado", "ct": "connecticut", "de": "delaware", "fl": "florida", "ga": "georgia",
+    "hi": "hawaii", "id": "idaho", "il": "illinois", "in": "indiana", "ia": "iowa",
+    "ks": "kansas", "ky": "kentucky", "la": "louisiana", "me": "maine", "md": "maryland",
+    "ma": "massachusetts", "mi": "michigan", "mn": "minnesota", "ms": "mississippi", "mo": "missouri",
+    "mt": "montana", "ne": "nebraska", "nv": "nevada", "nh": "new hampshire", "nj": "new jersey",
+    "nm": "new mexico", "ny": "new york", "nc": "north carolina", "nd": "north dakota", "oh": "ohio",
+    "ok": "oklahoma", "or": "oregon", "pa": "pennsylvania", "ri": "rhode island", "sc": "south carolina",
+    "sd": "south dakota", "tn": "tennessee", "tx": "texas", "ut": "utah", "vt": "vermont",
+    "va": "virginia", "wa": "washington", "wv": "west virginia", "wi": "wisconsin", "wy": "wyoming"
+}
+US_STATE_NAMES = {v: k for k, v in US_STATES.items()}
+
+IN_STATES = {
+    "ap": "andhra pradesh", "ar": "arunachal pradesh", "as": "assam", "br": "bihar", "cg": "chhattisgarh",
+    "ga": "goa", "gj": "gujarat", "hr": "haryana", "hp": "himachal pradesh", "jh": "jharkhand",
+    "ka": "karnataka", "kl": "kerala", "mp": "madhya pradesh", "mh": "maharashtra", "mn": "manipur",
+    "ml": "meghalaya", "mz": "mizoram", "nl": "nagaland", "od": "odisha", "pb": "punjab",
+    "rj": "rajasthan", "sk": "sikkim", "tn": "tamil nadu", "tg": "telangana", "tr": "tripura",
+    "up": "uttar pradesh", "uk": "uttarakhand", "wb": "west bengal", "dl": "delhi"
+}
+IN_STATE_NAMES = {v: k for k, v in IN_STATES.items()}
+
 DOMAIN_REGEX = re.compile(r'\.(com|in|org|net|co|io|fr|gov|edu)\b', re.IGNORECASE)
 PUNCT_REGEX = re.compile(r'[^a-z0-9]+')
 DIGIT_PREFIX_ZERO_REGEX = re.compile(r'\b0+(\d+)\b')
+POSTAL_CODE_REGEX = re.compile(r'\b(\d{5,6})\b')
 
 
 def transliterate_text(text: str) -> str:
@@ -82,7 +108,6 @@ def clean_string(text: str) -> str:
     """Normalizes text: transliterates Indic, folds accents, strips domains, lowercases."""
     if not text or text == "None" or text == "null":
         return ""
-    # Fast path for pure ASCII
     if not text.isascii():
         text = transliterate_text(text)
         text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
@@ -93,11 +118,10 @@ def clean_string(text: str) -> str:
     return text.strip()
 
 
-
 def extract_name_components(cleaned_name: str):
     """
-    Splits business name into core brand name, tokens, and legal suffixes.
-    Returns (core_brand_name, informative_tokens, legal_suffixes_found).
+    Splits business name into core brand name, tokens, acronym, and legal suffixes.
+    Returns (core_brand_name, informative_tokens, legal_suffixes_found, acronym).
     """
     words = cleaned_name.split()
     core_words = []
@@ -112,18 +136,52 @@ def extract_name_components(cleaned_name: str):
     core_name = " ".join(core_words) if core_words else cleaned_name
     tokens = [w for w in core_words if w not in GENERIC_STOPWORDS and len(w) >= 2]
     
-    return core_name, tokens, set(suffixes_found)
+    # Generate acronym if multi-word
+    acronym = "".join([w[0] for w in core_words if w and w[0].isalnum()]) if len(core_words) >= 2 else ""
+    
+    return core_name, tokens, set(suffixes_found), acronym
 
 
-def extract_addr_components(cleaned_addr: str):
+def extract_addr_components(cleaned_addr: str, country: str = ""):
     """
-    Extracts normalized numeric anchors and distinctive address words.
-    Returns (numeric_anchors, address_tokens).
+    Extracts normalized numeric anchors, distinctive address words, postal code, and state code.
+    Returns (numeric_anchors, address_tokens, postal_code, state_code).
     """
     words = cleaned_addr.split()
     nums = []
     tokens = []
+    postal_code = ""
+    state_code = ""
     
+    # Extract postal code (5-digit or 6-digit)
+    post_match = POSTAL_CODE_REGEX.search(cleaned_addr)
+    if post_match:
+        postal_code = post_match.group(1)
+
+    # Extract state code
+    addr_text = f" {cleaned_addr} "
+    if country == "US" or not country:
+        for full, code in US_STATE_NAMES.items():
+            if f" {full} " in addr_text:
+                state_code = code
+                break
+        if not state_code:
+            for w in words:
+                if w in US_STATES:
+                    state_code = w
+                    break
+                    
+    if country == "India" or (not state_code and not country):
+        for full, code in IN_STATE_NAMES.items():
+            if f" {full} " in addr_text:
+                state_code = code
+                break
+        if not state_code:
+            for w in words:
+                if w in IN_STATES:
+                    state_code = w
+                    break
+
     for w in words:
         if any(c.isdigit() for c in w):
             num_clean = re.sub(r'^0+', '', w)
@@ -132,4 +190,4 @@ def extract_addr_components(cleaned_addr: str):
         elif len(w) >= 3 and w not in GENERIC_STOPWORDS:
             tokens.append(w)
             
-    return nums, tokens
+    return nums, tokens, postal_code, state_code

@@ -1,10 +1,11 @@
 """
 Optimized, Resumable End-to-End Pipeline for Business Entity Resolution.
 Supports:
-  1. Crash-proof auto-resume (detects already scored entities and skips them)
-  2. Multi-core parallel feature extraction
-  3. Strict country partitioning and streaming TSV writes
-  4. Automatic validation via utils/validate_submission.py
+  1. High-recall multi-channel blocker (3-grams, acronyms, geo anchors)
+  2. 24-dimensional pairwise feature extraction
+  3. LightGBM classifier with Hard Negative Geo-Veto
+  4. Crash-proof auto-resume checkpointing
+  5. Automatic deduplication and validation via utils/validate_submission.py
 """
 
 import os
@@ -13,7 +14,6 @@ import time
 import subprocess
 import polars as pl
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor
 
 # Ensure src can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -24,7 +24,7 @@ from src.model import MatchingModel, compute_macro_f05
 
 
 class EntityResolutionPipeline:
-    def __init__(self, model_path="code/business_entity_resolution/model_checkpoint.joblib", default_threshold=0.76):
+    def __init__(self, model_path="code/business_entity_resolution/model_checkpoint.joblib", default_threshold=0.80):
         self.model_path = model_path
         self.default_threshold = default_threshold
         self.model = MatchingModel()
@@ -115,22 +115,25 @@ class EntityResolutionPipeline:
             print(f"Loaded {len(target_df):,} target records for {country} in {time.time()-t_country:.2f}s")
             
             # 2. Build Inverted Index Blocker
-            blocker = MultiIndexBlocker(max_candidates=25)
-            blocker.fit_target_universe(target_ids, target_names, target_addrs)
+            blocker = MultiIndexBlocker(max_candidates=30)
+            blocker.fit_target_universe(target_ids, target_names, target_addrs, country)
             tid_to_idx = {tid: i for i, tid in enumerate(target_ids)}
             
             def get_target_rec(idx):
                 cn = blocker.cleaned_names[idx]
-                _, _, suf = extract_name_components(cn)
+                _, _, suf, acr = extract_name_components(cn)
                 return {
                     'target_id': target_ids[idx],
                     'cleaned_name': cn,
                     'cleaned_addr': blocker.cleaned_addrs[idx],
                     'core_name': blocker.core_names[idx],
                     'name_tokens': blocker.name_tokens_list[idx],
+                    'acronym': acr,
                     'legal_suffixes': suf,
                     'addr_nums': blocker.addr_nums_list[idx],
-                    'addr_words': blocker.addr_words_list[idx]
+                    'addr_words': blocker.addr_words_list[idx],
+                    'postal_code': blocker.postal_codes_list[idx],
+                    'state_code': blocker.state_codes_list[idx]
                 }
 
             # 3. Process remaining queries in chunks
@@ -142,21 +145,23 @@ class EntityResolutionPipeline:
                     addrs_chunk = addrs_to_process[c_start:c_end]
                     
                     t_chunk = time.time()
-                    cand_map = blocker.generate_candidates(qids_chunk, names_chunk, addrs_chunk)
+                    cand_map = blocker.generate_candidates(qids_chunk, names_chunk, addrs_chunk, country)
                     
-                    # Extract features
+                    # Extract 26 deep pairwise features
                     chunk_pairs = []
                     chunk_feats = []
+
                     
                     for q_idx, qid in enumerate(qids_chunk):
                         cn = clean_string(names_chunk[q_idx])
                         ca = clean_string(addrs_chunk[q_idx])
-                        core_name, ntoks, suffixes = extract_name_components(cn)
-                        nums, awords = extract_addr_components(ca)
+                        core_name, ntoks, suffixes, acr = extract_name_components(cn)
+                        nums, awords, post, state_code = extract_addr_components(ca, country)
                         q_rec = {
                             'cleaned_name': cn, 'cleaned_addr': ca, 'core_name': core_name,
-                            'name_tokens': ntoks, 'legal_suffixes': suffixes,
-                            'addr_nums': nums, 'addr_words': awords
+                            'name_tokens': ntoks, 'acronym': acr, 'legal_suffixes': suffixes,
+                            'addr_nums': nums, 'addr_words': awords,
+                            'postal_code': post, 'state_code': state_code
                         }
                         
                         cands = cand_map.get(qid, [])
@@ -167,17 +172,19 @@ class EntityResolutionPipeline:
                                 chunk_pairs.append((qid, tid))
                                 chunk_feats.append(feat)
                                 
-                    # Score batch with model
+                    # Score batch with model using country-specific threshold
                     matched_map = {qid: [] for qid in qids_chunk}
+                    country_tau = self.model.country_thresholds.get(country, self.model.best_threshold)
                     if chunk_feats:
                         X_chunk = np.array(chunk_feats, dtype=np.float32)
                         probs = self.model.predict_proba(X_chunk)
                         
                         for i in range(len(chunk_pairs)):
                             score = float(probs[i])
-                            if score >= self.model.best_threshold:
+                            if score >= country_tau:
                                 qid, tid = chunk_pairs[i]
                                 matched_map[qid].append(tid)
+
                                 
                     # Write to TSVs
                     for qid in qids_chunk:
@@ -213,7 +220,6 @@ class EntityResolutionPipeline:
             "--candidate", cand_path,
             "--test-dir", test_dir
         ]
-
         res = subprocess.run(val_cmd, capture_output=True, text=True)
         print(res.stdout)
         if res.stderr:
