@@ -1,134 +1,233 @@
-# ML Challenge 2026: Business Entity Resolution Solution Documentation
+# ML Challenge 2026: Business Entity Resolution — Solution Documentation
 
-**Challenge:** Amazon ML Challenge 2026 — Business Entity Resolution  
-**Evaluation Metric:** Macro $F_{0.5}$ Score (Precision-Weighted)  
+**Team:** Apocalypso
+**Members:** Anurag Chaudhuri (Team Leader), Tamojit Roy, Arunanshu Dey
+**Challenge:** Amazon ML Challenge 2026 — Business Entity Resolution
+**Metric:** Macro F0.5 per Source 1 entity (precision weighted 2× over recall)
 
 ---
 
 ## 1. Executive Summary
-We present a high-performance, multi-stage Business Entity Resolution framework designed to resolve noisy business records across three independent sources (`S1`, `S2`, `S3`) spanning over 11 million records. Our approach combines **strict zero-leakage country partitioning**, a **unified Brahmi Indic transliteration engine**, and a **high-recall multi-channel inverted index blocker** that prunes 17.2 trillion pairwise comparisons by **99.999%**. Using a 26-dimensional C++ accelerated RapidFuzz feature pipeline, a **LightGBM gradient-boosted decision tree** with **Hard Negative Geo-Veto** scores candidate pairs with country-calibrated decision thresholds ($\tau_{\text{US}} = 0.760, \tau_{\text{India}} = 0.780$) optimized directly for macro $F_{0.5}$, achieving an outstanding **validation macro $F_{0.5}$ score of 0.8654** (US: 0.8869, India: 0.8332).
+
+For each Source 1 (S1) business we return **all** of its Source 2 / Source 3 records. The pipeline has five stages:
+
+1. **Component-based parsing.** Addresses are split into comma components and each component is identified by its role, never by its position. Names are normalised for aliases, legal forms, scripts and noise.
+2. **Scalable candidate generation.** A compact CSR inverted index over hashed keys in 13 channels. It returns at most 25 S2 + 25 S3 candidates per S1, i.e. about 50 instead of millions.
+3. **Pairwise scoring.** A LightGBM model over 71 vectorised similarity features. These include house-number relations designed to reject the dataset's decoy records.
+4. **Global exclusive assignment.** Every S2/S3 record is given to at most one S1, its best-scoring one, with a margin requirement. There is no cap on how many records an S1 may receive.
+5. **Per-country thresholds** tuned on a density-adjusted F0.5.
+
+**Validation macro F0.5** (19,995 held-out S1, exclusivity simulated with test-time mechanics):
+
+| | Previous pipeline | This pipeline |
+|---|---|---|
+| US | 0.8869 | **0.9794** (P 0.994, R 0.941, singletons 99.1%) |
+| India | 0.8332 | **0.9563** (P 0.982, R 0.893, singletons 99.6%) |
+| Pooled | 0.8654 | **0.9702** |
+
+The fast in-code metric was checked against `utils/evaluate_local.py` and agrees exactly. 2-fold cross-fitted thresholds give 0.979/0.980 (US) and 0.958/0.955 (India), so there is no threshold overfitting.
 
 ---
 
 ## 2. Methodology
 
-### 2.1 Problem Analysis
-During comprehensive exploratory data analysis (EDA) across the 22 million training and test records, four key insights were discovered:
-1. **Zero Cross-Country Leakage**: Across all 2,206,821 ground truth links in the training data, exactly **0.00%** crossed country borders. Matches are strictly intra-national.
-2. **Multilingual Indic Script Barrier**: In Indian records, **27.5% of Source 2 and Source 3 business names are written in native Indic scripts** (Devanagari, Tamil, Telugu, Bengali, Gujarati, Kannada, Malayalam, Oriya, Gurmukhi), whereas Source 1 names are **100% Romanized/English**. Unnormalized string matching completely fails on over a quarter of Indian records.
-3. **Leading-Zero Address Variations**: Addresses frequently differ by leading zeros in street, house, or plot numbers (e.g., `AF-0684` vs `Af-684`, `Office No. 0404` vs `404`, `B-0029` vs `B-29`).
-4. **Asymmetric Precision Penalty**: The evaluation metric is macro $F_{0.5}$, where precision is weighted twice as heavily as recall ($\beta = 0.5$). False merges severely penalize the score, and singletons (5.58% of entities with no match) earn a full 1.0 if predicted empty but drop to 0.0 if even a single false match is made.
+### 2.1 Data analysis that drove the design
 
-### 2.2 Solution Strategy
-- **Approach Type**: Multi-Stage Hybrid: Country Partitioning $\rightarrow$ Multilingual Normalization $\rightarrow$ Inverted Index Blocking $\rightarrow$ C++ Pairwise Feature Extraction $\rightarrow$ LightGBM Ranking with Hard Negative Geo-Veto & Asymmetric $F_{0.5}$ Threshold Optimization.
-- **Core Innovations**:
-  - **Unified Brahmi Transliteration**: Exploits the identical relative Unicode offset architecture of Indic alphabets to phonetically map Hindi, Tamil, Telugu, Bengali, etc., into phonetic Latin script at microsecond speeds.
-  - **Zero-Stripped Numeric Address Anchors**: Normalizes house numbers and PIN codes, connecting noisy street references even when business names differ (trade names / DBAs).
-  - **Hard Negative Geo-Veto**: Explicit state and postal contradiction gates vetoing cross-state false positive merges.
-  - **Country-Specific $F_{0.5}$ Calibration**: Precision-biased threshold tuning specifically targeted at maximizing singleton credit and eliminating false merges per geography.
+Exhaustive grep-based analysis of all 22M train and test records established six facts.
+
+1. **An S1 links to several records per source.** On validation, 72% of S1 have 3 or more links, and 62.5% of non-singletons have 2 or more S2 links. A "one match per source" constraint would limit even a perfect model to about 0.86.
+2. **Each S2/S3 record belongs to at most one S1.** Many different S1 share a name: over 100 distinct US "Helios" entities, and 342 "Bordeaux Amicale" in France. The global argmax-per-target assignment is the main defence against these clones and against co-tenant addresses.
+3. **Deliberate decoys.** The data contains unlinked records cloned from an S1 with three changes:
+   - the house number is shifted (US +3…+21; India the last part ±1, e.g. 792/15→792/17);
+   - a legal form is swapped or a word is added (Holdings, Group, Ventures…).
+
+   True copies instead keep the number, apart from zero padding, markers, a dropped end digit or a suffix letter. **The test set has about 1.9× more unlinked targets per S1 than train**, which is why thresholds are chosen on a density-adjusted objective.
+4. **No postal codes in US or India.** US addresses have no ZIPs and India has essentially no PINs, so 5–6-digit tokens are house or flat numbers.
+5. **France (unseen in training) is a closed world.** It has 15 cities. S1 records carry regions, while targets carry departments, cities or nothing. Entities are identified by street, house number and bis/ter.
+6. **Noise injected into names:**
+   - alias rows (`<synthetic> dba|f/k/a|née|trading as <S1 name>`);
+   - synthetic "garbage" names built from a small syllable set;
+   - domain/handle names;
+   - native Indic scripts (23.5% of India S2), which are word-for-word transliterations;
+   - leetspeak, dotted initialisms, duplicated words and prefix/suffix junk.
+
+### 2.2 Normalisation (`normalizer.py`)
+
+**Names**
+- Decorations are removed: `| www…`, phone and store-number tails, leading junk.
+- Alias markers are split so the real right-hand side is used.
+- Dotted initialisms are collapsed (`L.L.C.`→`llc`).
+- Leetspeak is repaired inside mixed tokens, runs of single letters are merged, and duplicated tokens are collapsed.
+- Honorifics and France/India tokens are dropped.
+- Legal forms go into **one global class table** (INC~CORP, LLC, LP, LLP, PC, PLC, PVT~LTD, PUBLIC, French forms). This drives the legal-conflict decoy features.
+- Descriptive words (services, enterprises, fils…) stay in the brand.
+- Each name is reduced to these keys:
+  - core name, concatenated and accent-deleted variants for domains;
+  - a consonant **phonetic skeleton**;
+  - acronym and short name;
+  - flags: domain, garbage (dynamic-programming segmentation over the syllable vocabulary), alias, native script.
+- **Indic transliteration.** Per-script tables cover all 9 Brahmi scripts, with inherent-vowel and schwa-deletion rules, nukta, anusvara and chillu handling. A **native→Latin lexicon** learned from aligned training GT pairs (1,318 tokens; 94.6% coverage of native tokens in test) is applied first. It was built excluding the validation and training S1.
+
+**Addresses**
+- **State or region** is recognised only when a *whole component* equals it. This fixes street names like "Ohio Avenue" and "Hadley Ct", and "West Virginia".
+- Native-script Indian states are recognised, and Telangana/Andhra Pradesh are merged.
+- French departments, cities and postal codes are mapped to regions.
+- **House number:**
+  - kept as an atomic compound (`104/1/1`, `16/11/23/37/a`) with its suffix (bis/ter/letter) and ranges;
+  - never taken from an ordinal (`12nd`), a glued type (`cour2`), or a number after a French street type (`Rue du 8 Mai 1945`);
+  - the `B3/` artifact is removed.
+- **Street core:** street type, articles, directionals and titles are canonicalised. A US `SAINT` at the end is read as ST.
+- **Other components:**
+  - locality and city (US city-noise stripped, India city aliases);
+  - unit id;
+  - verbatim and canonical address signatures.
+
+Parsing runs in a multiprocessing pool into Arrow-backed columns (`records.py`) at roughly 31 µs per record.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
 
-### 3.1 Blocking Strategy & Keys Used
-To reduce the $1.73 \times 10^6 \times 9.97 \times 10^6 \approx 17.2 \text{ Trillion}$ comparison space to a tractable candidate set, we construct an inverted index blocker per country partition:
-1. **Core Brand Name Words (Channel A)**: Distinctive business name tokens (excluding legal suffixes like `LLC`, `Pvt Ltd`, `SARL`) weighted by Inverse Document Frequency ($\text{IDF} = \frac{100}{\text{DF} + 10}$).
-2. **Brand 4-gram Prefix (Channel B)**: First 4 characters of the core brand name to capture typos, suffixes, and inflections (e.g., `payn`, `dahl`, `maur`).
-3. **Character 3-Grams (Channel C)**: Interior tri-grams of brand names to withstand heavy transliteration variations and typos.
-4. **Acronym & Initials (Channel D)**: First letters of multi-word business names (e.g., `KEC` $\leftrightarrow$ `Kamla Engineering Corp`).
-5. **Address Anchors (Channel E)**: Tuple keys combining normalized numbers and locality words: `(normalized_number, locality_word)` and `(postal_code, normalized_number)` to capture trade names/acronyms (e.g., `EC` $\leftrightarrow$ `East Consultants` via `(1-13-14, vinayaknagar)`).
+### 3.1 Strategy and keys (`blocking.py`)
 
-### 3.2 Candidate Set Statistics
-- **Candidate space reduction ratio**: $> 99.999\%$
-- **Average candidate pairs per query**: $\approx 22 - 25$
-- **Candidate retrieval latency**: $\approx 0.2 - 0.5 \text{ ms}$ per query
-- **Blocking Recall**: $> 92\%$ on true matches
+The index is built per country, since there are no cross-country links. Every key is a `(channel, string)` pair hashed to 40 bits.
+
+The index is a **CSR inverted index**: one sorted int64 array plus int32 postings, with no per-posting Python objects. The US train universe of 6.19M records indexes into 768 MB. Posting lists longer than a per-channel document-frequency cap are dropped at build time. This caps the cost of any query, which is what lets the approach scale.
+
+| Channel | Key | Weight |
+|---|---|---|
+| Name tokens | core tokens (incl. alias right-hand side) | 120/(df+10), df ≤ 3500 |
+| Prefix | first 4 chars of concatenated core | 35/(df+10) |
+| Phonetic | first 5 chars of skeleton (Indic/typo robust) | 50/(df+10) |
+| Char 3-grams | 3-grams of the first brand token | 3 each, df ≤ 2000 |
+| Acronym ↔ short name | multi-word acronym vs single short name (cross lookup) | 120/(df+10), df ≤ 500 |
+| House number × street | (number, first street token) | 150/(df+10) |
+| Number × word | (number, rare street/locality word), ≤ 2 × 3 keys | 100/(df+10) |
+| House number × name | (number, first brand token) | 150/(df+10) |
+| Name × street (number-free) | (rare name token, rare street/locality token) | 120/(df+10) |
+| Street × city (number-free) | (rare street token, city) | 60/(df+10) |
+| Address signatures | verbatim / canonical component sets | 80·min(1,5/df), 70·min(1,5/df) |
+
+**Query procedure:**
+- Weights accumulate in a dense float32 array.
+- The **top 25 S2 and top 25 S3** are selected by argpartition.
+- The accumulator is reset after each query.
+- One query takes about 0.5 ms.
+
+### 3.2 Candidate set statistics
+
+- **Candidates per S1:** about 49.7 on average (at most 50: 25 per source). Real links average 3.5 per S1.
+- **Reduction ratio:** each S1 is compared with about 50 of 1.4M–4.7M same-country targets, i.e. more than 99.99% of comparisons are avoided. Nothing is ever compared across all records.
+- **Blocking recall** (validation links retrieved within the candidate set):
+
+| K per source | 5 | 10 | 15 | 20 | 25 |
+|---|---|---|---|---|---|
+| US | 92.5% | 94.6% | 95.5% | 96.0% | 96.4% |
+| India | 86.2% | 89.5% | 90.7% | 91.5% | 92.0% |
+
+- **Where recall is lost:** targets with an empty address (about 45% retrieved: name-only evidence competes with address-anchored candidates) and synthetic garbage names.
 
 ---
 
 ## 4. Matching Model
 
-### 4.1 Feature Engineering (26 Pairwise Features)
-For each candidate pair `(Query, Target)`, we compute a 26-dimensional feature vector using C++ accelerated RapidFuzz:
-- **Name Features**:
-  1. `name_token_sort_ratio`: Word-order invariant similarity.
-  2. `name_token_set_ratio`: Substring / set overlap similarity.
-  3. `name_ratio`: Full string Levenshtein ratio.
-  4. `core_ratio`: Ratio on core brand name (excluding legal suffixes).
-  5. `core_token_set_ratio`: Token set ratio on core brand name.
-  6. `jaro_winkler_sim`: Prefix-sensitive string similarity.
-  7. `core_first_word_ratio`: Ratio of the primary brand anchor token.
-  8. `name_length_diff`: Relative length disparity.
-  9. `prefix_match`: Binary indicator if first 4 characters match.
-  10. `acronym_match`: Binary indicator of acronym / initials equivalence.
-  11. `suffix_compatible`: Tristate compatibility score for legal forms (LLC vs Corp vs Pvt Ltd).
-- **Address & Geo Features**:
-  12. `target_addr_empty`: Indicator if target address is missing.
-  13. `addr_token_set_ratio`: RapidFuzz ratio on address strings.
-  14. `addr_token_jaccard`: Jaccard similarity of distinctive address words.
-  15. `addr_token_overlap`: Integer count of shared address words.
-  16. `locality_match`: Match indicator between parsed city/locality tokens.
-  17. `addr_num_jaccard`: Jaccard similarity of address numeric tokens.
-  18. `exact_number_match`: Binary indicator if house number or PIN code matches exactly.
-  19. `postal_code_match`: Exact postal code match flag.
-  20. `postal_code_conflict`: Contradictory postal codes indicator.
-  21. `geo_state_match`: State code equality indicator.
-  22. `geo_state_conflict`: Conflicting state code indicator (Hard Veto trigger).
-- **Composite & Metadata Features**:
-  23. `name_in_addr`: Binary indicator if brand name appears within the address field.
-  24. `composite_confidence`: Geometric mean of name similarity and address similarity.
-  25. `num_locality_hit`: Joint numeric and locality co-occurrence score.
-  26. `target_source`: Categorical indicator of candidate origin (Source 2 vs Source 3).
+### 4.1 Features (71, `feature_extractor.py`)
 
-### 4.2 Model Architecture & Threshold Selection
-- **Model Type**: LightGBM Classifier (400 trees, max depth 7, 45 leaves, learning rate 0.05, L1/L2 regularization).
-- **Hard Negative Geo-Veto**: Candidate pairs with confirmed state conflicts (`geo_state_conflict == 1`) whose name ratio is below 0.95 are immediately vetoed ($\text{score} \leftarrow 0.0$), eliminating false cross-state merges.
-- **Threshold Selection**: Calibrated per country on a stratified 20,000-query validation set:
-  - $\tau_{\text{US}} = 0.760$
-  - $\tau_{\text{India}} = 0.780$
-  - $\tau_{\text{France}} = 0.760$
+String similarities are computed with `rapidfuzz.process.cpdist` (multithreaded C++). Flags, counts and hashes are numpy, and one lean Python loop covers set logic. The per-pair cost is about 29 µs.
+
+- **Name:**
+  - token set / sort / partial ratio and Jaro-Winkler on the full name;
+  - ratio and token set on the core;
+  - concatenation ratio and domain-aware partial;
+  - phonetic skeleton ratio and first-token ratio;
+  - fuzzy token coverage both ways;
+  - IDF overlap, unmatched-target IDF, missing-query IDF;
+  - decoy-word and noise-word additions;
+  - acronym match;
+  - legal-form conflict, added, dropped;
+  - target flags: domain, garbage, alias, native script, added country token.
+- **Address:**
+  - token set of address, street and locality; street ratio; fuzzy street-core containment;
+  - city ratio and equality; street-type equality;
+  - state match and conflict;
+  - verbatim and canonical signature equality;
+  - unit equal or different; empty-address flags.
+- **House number:**
+  - present, exact, digits-equal;
+  - suffix both-different or one-missing;
+  - prefix/suffix digit drop, 1-edit drop, 1-substitution, last-digit substitution;
+  - compound prefix chain, last-part difference and its size;
+  - log and relative difference; range hit; compound flag; parse cleanliness;
+  - compound-number recall and extras; digit recall;
+  - a categorical relation code (exact / soft / conflict / missing).
+- **Context counts:**
+  - other S1 with the same core name or the same address (clones and co-tenants);
+  - targets sharing the name or the (number, street) key.
+- There are no retrieval-rank features, so competitor pairs are scored exactly like test pairs.
+
+### 4.2 Model
+
+- LightGBM (binary):
+  - learning rate 0.08, 63 leaves, min_data_in_leaf 100, 0.8 feature/bagging fraction, λ2 = 1;
+  - early stopping on a 10% S1-grouped holdout (best iteration 828).
+- **Training data:** 4.95M candidate pairs from 50k random S1 per country (US, India), disjoint from validation. Only retrieved candidates are used, matching the inference distribution.
+- Negatives whose target is linked to no S1 are weighted by r ≈ 1.9, the test/train ratio of unlinked targets per S1.
+- **Top features by gain:** composite name×address, address token set, house-number relation, concatenation ratio, digit recall, name token sort, unmatched-target IDF, compound-number extras, state conflict.
+
+### 4.3 Decision rule (`model.py`)
+
+1. **Exclusivity.** A pair (Q, T) is accepted only if Q is T's best-scoring S1 and its score exceeds the best competitor's by more than δ. Ties are dropped.
+2. **Threshold.** A per-country threshold τ: US 0.88, India 0.89.
+3. **Sibling rescue.** A candidate with score ≥ τ_lo (US 0.68, India 0.59) is accepted if it shares house number and street with an already-accepted target of the same S1.
+4. **No per-source cap:** an S1 may receive many records from the same source.
+5. **France.** Parameters are the conservative maximum of the US and India settings, plus hard gates when parses are clean: house number + suffix must agree, canonical city must agree, and street-core containment must be ≥ 0.5.
+
+**Threshold selection:**
+- Grid over τ, δ, veto, lonely-link τ1 and the rescue/suppress rules, maximising a **density-adjusted F0.5**. False positives on unlinked targets and singleton errors are up-weighted by r, so that thresholds suit test-time decoy density.
+- The largest τ within 0.002 of the optimum is chosen.
+- **Exclusivity simulation during validation:**
+  - candidate targets are reverse-blocked against all train S1;
+  - each found competitor S1′ is forward-blocked;
+  - (S1′, T) counts only if T is in S1′'s own top-K, exactly as at test time.
 
 ---
 
-## 5. Results & Error Analysis
+## 5. Results and Error Analysis
 
-### 5.1 Validation Performance
-- **Validation Dataset**: 19,995 stratified Source 1 entities with ground truth (covering US and India, with natural singleton distribution).
-- **Overall Macro $F_{0.5}$ Score**: **0.8654**
-  - **US Macro $F_{0.5}$**: **0.8869**
-  - **India Macro $F_{0.5}$**: **0.8332**
-- **Optimal Decision Thresholds**: $\tau_{\text{US}} = 0.760, \tau_{\text{India}} = 0.780$
+### 5.1 Validation
 
-### 5.2 Error Analysis
-- **False Positives (Wrong Merges)**: Dramatically reduced by Hard Negative Geo-Veto. Remaining false positives occur in national retail chains that share exact street addresses in multi-tenant commercial malls.
-- **False Negatives (Missed Matches)**: Occur predominantly when Source 2/3 records have missing addresses combined with phonetic drift in regional Indian brand transliterations.
+The per-country results are in §1.
 
----
+**Test-set sanity:** predicted links per S1 are 3.29 (US), 3.08 (India) and 3.02 (France). Predicted-empty shares are 6.0%, 7.2% and 7.0% respectively. This matches the ground-truth shape of about 3.5 links and 5.6% singletons.
 
-## 6. Conclusion
-By systematically addressing the underlying domain challenges — multilingual Indic scripts, zero-leakage country partitioning, numeric address zero-padding, and cross-state geo-vetoing — our hybrid blocking and gradient boosting pipeline scales seamlessly to over 10 million records while keeping peak memory under 4 GB. The precision-weighted thresholding achieves an outstanding **0.8654 validation macro $F_{0.5}$**, delivering both industrial scalability and competitive leaderboard performance.
+### 5.2 Remaining errors
+
+- **Misses at the candidate stage dominate** (US 1,513 validation links not retrieved vs 873 retrieved but below τ; India 2,206 vs 705). The main causes are:
+  - targets with an empty address;
+  - garbage names without a distinctive address;
+  - India targets whose name and address both differ strongly (native script plus a reordered address).
+- **False positives are rare** (US 50, India 67 on validation). They split between records owned by another S1 that exclusivity missed and unlinked decoys whose number change looks like a true digit drop.
 
 ---
 
-## Appendix: Code Artefacts
-All reproduction code is packaged under `code/business_entity_resolution/`:
+## 6. Reproducibility
+
+`code/business_entity_resolution/README.md` has the exact commands. From `student_resource/`:
+
 ```
-code/business_entity_resolution/
-├── README.md               # End-to-end execution guide
-├── requirements.txt        # Pinned dependencies
-├── model_checkpoint.joblib # Trained LightGBM model & calibrated thresholds
-└── src/
-    ├── __init__.py
-    ├── normalizer.py       # Multilingual text cleaning & Brahmi transliteration
-    ├── blocking.py         # MultiIndexBlocker inverted index candidate generator
-    ├── feature_extractor.py# 26-dimensional RapidFuzz pairwise feature extractor
-    ├── model.py            # LightGBM classifier & threshold optimizer with Geo-Veto
-    ├── pipeline.py         # End-to-end streaming orchestrator
-    └── train_evaluate.py   # Training and validation benchmark script
+python -u code/business_entity_resolution/src/train_evaluate.py   # ~23 min: lexicon, features, LightGBM, thresholds
+python -u code/business_entity_resolution/src/pipeline.py         # ~80 min: writes output/matching_results.tsv + candidate_pairs.tsv
 ```
-**Entry Point to Reproduce**:
-```bash
-python code/business_entity_resolution/src/pipeline.py
-```
-This automatically produces `output/matching_results.tsv` and `output/candidate_pairs.tsv` and runs `utils/validate_submission.py`.
+
+- Every stage is resumable.
+- `--smoke` runs a small end-to-end check.
+- `pipeline.py --reassign` re-applies thresholds from cached scores.
+- Hardware: Windows 11, 8 cores, 16 GB RAM. Peak memory was about 12 GB.
+
+**Code artefacts** (`code/business_entity_resolution/`):
+- `src/`: `normalizer.py`, `records.py`, `lexicon.py`, `blocking.py`, `feature_extractor.py`, `model.py`, `train_evaluate.py`, `pipeline.py`, `runtime.py`
+- `model_checkpoint.joblib`: the LightGBM booster, feature list and candidate K
+- `thresholds.json`: per-country decision parameters and the validation report
+- `native_lexicon.json`: the learned native→Latin lexicon
+
+**Models and data:** LightGBM (MIT licence): 828 trees × up to 63 leaves, about 52k leaf values, far below the 8B-parameter limit. No other model is used. No external data, APIs or lookups were used. The French department/region and US/India state tables are generic geographic vocabularies used only for normalisation.

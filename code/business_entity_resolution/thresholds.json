@@ -1,0 +1,108 @@
+{
+  "countries": {
+    "France": {
+      "delta": 0.02,
+      "fr_gates": 14,
+      "suppress": false,
+      "tau": 0.89,
+      "tau1": null,
+      "tau_lo": 0.68,
+      "veto": 0
+    },
+    "India": {
+      "delta": 0.02,
+      "fr_gates": 0,
+      "suppress": false,
+      "tau": 0.89,
+      "tau1": null,
+      "tau_lo": 0.59,
+      "veto": 0
+    },
+    "US": {
+      "delta": 0.0,
+      "fr_gates": 0,
+      "suppress": false,
+      "tau": 0.88,
+      "tau1": null,
+      "tau_lo": 0.68,
+      "veto": 0
+    }
+  },
+  "created": "2026-09-27 18:58:20",
+  "default": {
+    "delta": 0.02,
+    "fr_gates": 0,
+    "suppress": false,
+    "tau": 0.89,
+    "tau1": null,
+    "tau_lo": 0.68,
+    "veto": 0
+  },
+  "k_infer": 25,
+  "r": {
+    "India": 1.9413724168142945,
+    "US": 1.8905665031447298
+  },
+  "val_report": {
+    "countries": {
+      "India": {
+        "F": 0.9563469108129607,
+        "FN_below_threshold": 705,
+        "FN_not_retrieved": 2206,
+        "FP_owned_by_other_S1": 32.0,
+        "FP_unlinked_decoy": 35.0,
+        "F_adj": 0.9556074256680581,
+        "F_without_exclusivity": 0.9550552093402432,
+        "crossfit_F": [
+          0.9575627833105921,
+          0.9544986890123779
+        ],
+        "macro_P": 0.9820508335696952,
+        "macro_R": 0.8932932043322515,
+        "nonsingleton_F": 0.9540288524586777,
+        "one_link_F": 0.8607235142118862,
+        "params": {
+          "delta": 0.02,
+          "fr_gates": 0,
+          "suppress": false,
+          "tau": 0.89,
+          "tau1": null,
+          "tau_lo": 0.59,
+          "veto": 0
+        },
+        "predict_us_per_row": 9.814342762749607,
+        "r": 1.9413724168142945,
+        "singleton_acc": 0.9955257270693513
+      },
+      "US": {
+        "F": 0.9794192542420243,
+        "FN_below_threshold": 873,
+        "FN_not_retrieved": 1513,
+        "FP_owned_by_other_S1": 8.0,
+        "FP_unlinked_decoy": 42.0,
+        "F_adj": 0.9786209989233817,
+        "F_without_exclusivity": 0.9787700256570653,
+        "crossfit_F": [
+          0.9788758770394372,
+          0.9795179636784684
+        ],
+        "macro_P": 0.994226653042001,
+        "macro_R": 0.9409546307042774,
+        "nonsingleton_F": 0.9787332317312433,
+        "one_link_F": 0.9337442218798151,
+        "params": {
+          "delta": 0.0,
+          "fr_gates": 0,
+          "suppress": false,
+          "tau": 0.88,
+          "tau1": null,
+          "tau_lo": 0.68,
+          "veto": 0
+        },
+        "predict_us_per_row": 10.063828654527404,
+        "r": 1.8905665031447298,
+        "singleton_acc": 0.9910313901345291
+      }
+    }
+  }
+}

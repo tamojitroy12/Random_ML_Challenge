@@ -1,242 +1,273 @@
 """
-High-Recall Multi-Channel Blocker with 3-gram Shingling, Acronyms, and Geo Anchors.
-Guarantees > 98.5% Candidate Blocking Recall ceiling.
+Candidate generation: compact CSR inverted index over hashed multi-channel keys.
+
+Keys are (channel, string) pairs hashed to int64 as (channel << 36) | (polars_hash(string) & 2^36-1).
+The index is built from packed (key << 23 | record) int64 arrays: one in-place sort, no Python
+objects per posting. Posting lists longer than a per-channel df cap are dropped at build time.
+
+Query: dense float32 accumulator over the universe, IDF-style per-channel weights, top-K per
+source (S2 / S3). The same class indexes S1 records for reverse blocking (source = 0).
 """
 
-from collections import defaultdict, Counter
-import time
-from .normalizer import clean_string, extract_name_components, extract_addr_components
+import numpy as np
+import polars as pl
+
+from .normalizer import GENERIC_NAME_WORDS, STREET_GENERIC
+
+# Channels
+CH_T, CH_P, CH_K, CH_G, CH_A, CH_S, CH_H, CH_N, CH_B, CH_X, CH_Y, CH_R, CH_C = range(13)
+CHANNEL_NAMES = ["token", "prefix4", "skel5", "gram3", "acronym", "short", "hn_street", "num_word",
+                 "hn_tok0", "name_x_street", "street_x_city", "raw_sig", "clean_sig"]
+HASH_BITS = 36
+MASK36 = (1 << HASH_BITS) - 1
+REC_BITS = 23
+MAX_RECS = 1 << REC_BITS
+
+# weight mode: 0 -> base/(df+10); 1 -> constant base; 2 -> base*min(1, 5/df)
+CH_BASE = np.array([120, 35, 50, 3, 120, 120, 150, 100, 150, 120, 60, 80, 70, 0, 0, 0], np.float64)
+CH_MODE = np.array([0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 1, 1, 1], np.int64)
+CH_BUILD_CAP = np.array([20000, 2500, 3000, 2000, 500, 500, 1000, 1000, 1000, 1000, 1000, 200, 200,
+                         0, 0, 0], np.int64)
+CH_QUERY_CAP = np.array([3500, 2500, 3000, 2000, 500, 500, 1000, 1000, 1000, 1000, 1000, 200, 200,
+                         0, 0, 0], np.int64)
+T_FALLBACK_CAP = 20000
 
 
-def get_char_3grams(text: str):
-    """Generates character 3-grams for typo-resilient candidate generation."""
-    t = f"^{text}$"
-    return [t[i:i+3] for i in range(len(t) - 2)]
+def _rare(tokens, generic, k):
+    cand = sorted({t for t in tokens if len(t) >= 3 and not t.isdigit() and t not in generic},
+                  key=lambda t: (-len(t), t))
+    return cand[:k]
 
 
-class MultiIndexBlocker:
-    def __init__(self, max_token_df=3500, max_prefix_df=2500, max_candidates=30):
-        self.max_token_df = max_token_df
-        self.max_prefix_df = max_prefix_df
-        self.max_candidates = max_candidates
-        
-        self.target_ids = []
-        self.cleaned_names = []
-        self.cleaned_addrs = []
-        self.core_names = []
-        self.name_tokens_list = []
-        self.acronyms_list = []
-        self.addr_nums_list = []
-        self.addr_words_list = []
-        self.postal_codes_list = []
-        self.state_codes_list = []
-        
-        self.token_to_targets = defaultdict(list)
-        self.prefix_to_targets = defaultdict(list)
-        self.acronym_to_targets = defaultdict(list)
-        self.gram3_to_targets = defaultdict(list)
-        self.addr_anchor_to_targets = defaultdict(list)
-        self.post_num_to_targets = defaultdict(list)
-        self.num_brand_to_targets = defaultdict(list)
-        
-        self.token_freq = Counter()
-        self.prefix_freq = Counter()
-        self.gram3_freq = Counter()
+def make_keys(core, concat, skel, tok0, acr, short, street, loc, city, hn_d, digits):
+    """String blocking keys (channels T..Y). Signature channels are added by the caller."""
+    keys = []
+    ctoks = [t for t in core.split() if len(t) >= 2]
+    seen = set()
+    for t in ctoks:
+        if t not in seen:
+            seen.add(t)
+            keys.append((CH_T, t))
+    if len(concat) >= 4:
+        keys.append((CH_P, concat[:4]))
+    if len(skel) >= 3:
+        keys.append((CH_K, skel[:5]))
+    if len(tok0) >= 3:
+        g = "^" + tok0 + "$"
+        grams = []
+        for i in range(len(g) - 2):
+            gg = g[i:i + 3]
+            if gg not in grams:
+                grams.append(gg)
+        for gg in grams[:12]:
+            keys.append((CH_G, gg))
+    if len(acr) >= 2:
+        keys.append((CH_A, acr))
+    if short:
+        keys.append((CH_S, short))
+    stoks = street.split()
+    st0 = next((t for t in stoks if t not in STREET_GENERIC and not t.isdigit()), stoks[0] if stoks else "")
+    if hn_d >= 0 and st0:
+        keys.append((CH_H, f"{hn_d}|{st0}"))
+    ltoks = loc.split()
+    words = _rare(stoks + ltoks, STREET_GENERIC, 3)
+    for d in digits.split()[:2]:
+        for w in words:
+            keys.append((CH_N, f"{d}|{w}"))
+    if hn_d >= 0 and tok0:
+        keys.append((CH_B, f"{hn_d}|{tok0}"))
+    rn = _rare(ctoks, GENERIC_NAME_WORDS, 2) or ([max(ctoks, key=len)] if ctoks else [])
+    rs = _rare(stoks + ltoks, STREET_GENERIC, 2)
+    for a in rn:
+        for b in rs:
+            keys.append((CH_X, f"{a}|{b}"))
+    rs_street = _rare(stoks, STREET_GENERIC, 1)
+    cty = city or (ltoks[-1] if ltoks else "")
+    if rs_street and cty:
+        keys.append((CH_Y, f"{rs_street[0]}|{cty}"))
+    return keys
 
-    def fit_target_universe(self, target_ids, names, addrs, country=""):
-        """
-        Builds multi-channel inverted indices over all target records for a country.
-        """
-        t0 = time.time()
-        self.target_ids = target_ids
-        n = len(target_ids)
-        
-        self.cleaned_names = [None] * n
-        self.cleaned_addrs = [None] * n
-        self.core_names = [None] * n
-        self.name_tokens_list = [None] * n
-        self.acronyms_list = [None] * n
-        self.addr_nums_list = [None] * n
-        self.addr_words_list = [None] * n
-        self.postal_codes_list = [None] * n
-        self.state_codes_list = [None] * n
-        
-        # Pass 1: Normalize & Count Frequencies
-        for i in range(n):
-            cn = clean_string(names[i])
-            ca = clean_string(addrs[i])
-            self.cleaned_names[i] = cn
-            self.cleaned_addrs[i] = ca
-            
-            core_name, ntoks, _, acr = extract_name_components(cn)
-            nums, awords, post_code, state_code = extract_addr_components(ca, country)
-            
-            self.core_names[i] = core_name
-            self.name_tokens_list[i] = ntoks
-            self.acronyms_list[i] = acr
-            self.addr_nums_list[i] = nums
-            self.addr_words_list[i] = awords
-            self.postal_codes_list[i] = post_code
-            self.state_codes_list[i] = state_code
-            
-            for tok in set(ntoks):
-                self.token_freq[tok] += 1
-                
-            if len(core_name) >= 4:
-                prefix = core_name[:4]
-                self.prefix_freq[prefix] += 1
-                
-            if ntoks:
-                # Primary brand 3-grams
-                for g in set(get_char_3grams(ntoks[0])):
-                    self.gram3_freq[g] += 1
 
-        # Pass 2: Index Keys with Safeguards
-        for i in range(n):
-            ntoks = self.name_tokens_list[i]
-            core_name = self.core_names[i]
-            nums = self.addr_nums_list[i]
-            awords = self.addr_words_list[i]
-            post = self.postal_codes_list[i]
-            acr = self.acronyms_list[i]
-            
-            # 1. Informative Name Tokens (with fallback if all are frequent)
-            indexed_any = False
-            for tok in set(ntoks):
-                if self.token_freq[tok] <= self.max_token_df:
-                    self.token_to_targets[tok].append(i)
-                    indexed_any = True
-            if not indexed_any and ntoks:
-                # Fallback: Index the rarest available token so entity is never dropped
-                rarest_tok = min(ntoks, key=lambda t: self.token_freq[t])
-                self.token_to_targets[rarest_tok].append(i)
-                    
-            # 2. 4-Character Brand Prefix
-            if len(core_name) >= 4:
-                prefix = core_name[:4]
-                if self.prefix_freq[prefix] <= self.max_prefix_df:
-                    self.prefix_to_targets[prefix].append(i)
-                    
-            # 3. Acronym Indexing
-            if acr:
-                self.acronym_to_targets[acr].append(i)
-            # Also if the name itself is 2-4 letters (e.g. 'EC', 'LOT')
-            if len(core_name) in (2, 3, 4) and core_name.isalpha():
-                self.acronym_to_targets[core_name].append(i)
-                
-            # 4. Character 3-grams of primary brand word
-            if ntoks:
-                for g in set(get_char_3grams(ntoks[0])):
-                    if self.gram3_freq[g] <= 2000:
-                        self.gram3_to_targets[g].append(i)
-                        
-            # 5. Numeric Address Anchors: (num, locality_word)
-            if nums and awords:
-                for num in nums[:2]:
-                    for w in awords[:3]:
-                        self.addr_anchor_to_targets[(num, w)].append(i)
-                        
-            # 6. Postal code + House Number Anchor
-            if post and nums:
-                for num in nums[:2]:
-                    self.post_num_to_targets[(post, num)].append(i)
-                    
-            # 7. Numeric + First Brand Word
-            if nums and ntoks:
-                primary_brand = ntoks[0]
-                for num in nums[:2]:
-                    self.num_brand_to_targets[(num, primary_brand)].append(i)
+def hash_strings(strs):
+    """Deterministic (cross-process) uint64 hashes; 0 is reserved for the empty string."""
+    if len(strs) == 0:
+        return np.zeros(0, np.uint64)
+    h = pl.Series(strs, dtype=pl.String).hash(seed=0).to_numpy().astype(np.uint64, copy=True)
+    empty = np.fromiter((len(s) == 0 for s in strs), dtype=bool, count=len(strs))
+    h[(h == 0) & ~empty] = np.uint64(1)
+    h[empty] = np.uint64(0)
+    return h
 
-        return time.time() - t0
 
-    def generate_candidates(self, query_ids, query_names, query_addrs, country=""):
-        """
-        Retrieves top candidate target IDs for query records with high-recall multi-key voting.
-        """
-        candidates_map = {}
-        
-        for q_idx in range(len(query_ids)):
-            qid = query_ids[q_idx]
-            cn = clean_string(query_names[q_idx])
-            ca = clean_string(query_addrs[q_idx])
-            
-            core_name, ntoks, _, q_acr = extract_name_components(cn)
-            nums, awords, post, state_code = extract_addr_components(ca, country)
-            
-            scores = Counter()
-            
-            # Channel 1: Name Tokens (IDF-weighted)
-            indexed_any = False
-            for tok in set(ntoks):
-                if tok in self.token_to_targets:
-                    df = self.token_freq[tok]
-                    weight = 120.0 / (df + 10)
-                    for tid_idx in self.token_to_targets[tok]:
-                        scores[tid_idx] += weight
-                    indexed_any = True
-            if not indexed_any and ntoks:
-                rarest_tok = min(ntoks, key=lambda t: self.token_freq[t])
-                if rarest_tok in self.token_to_targets:
-                    df = self.token_freq[rarest_tok]
-                    weight = 100.0 / (df + 10)
-                    for tid_idx in self.token_to_targets[rarest_tok]:
-                        scores[tid_idx] += weight
-                        
-            # Channel 2: Brand Prefix
-            if len(core_name) >= 4:
-                prefix = core_name[:4]
-                if prefix in self.prefix_to_targets:
-                    p_df = self.prefix_freq[prefix]
-                    p_weight = 35.0 / (p_df + 10)
-                    for tid_idx in self.prefix_to_targets[prefix]:
-                        scores[tid_idx] += p_weight
-                        
-            # Channel 3: Acronym Matching
-            if q_acr and q_acr in self.acronym_to_targets:
-                for tid_idx in self.acronym_to_targets[q_acr]:
-                    scores[tid_idx] += 40.0
-            if len(core_name) in (2, 3, 4) and core_name in self.acronym_to_targets:
-                for tid_idx in self.acronym_to_targets[core_name]:
-                    scores[tid_idx] += 40.0
-                    
-            # Channel 4: Character 3-grams (for heavy typos)
-            if ntoks:
-                q_grams = get_char_3grams(ntoks[0])
-                for g in q_grams:
-                    if g in self.gram3_to_targets:
-                        for tid_idx in self.gram3_to_targets[g]:
-                            scores[tid_idx] += 3.0
-                            
-            # Channel 5: (Postal Code, Number) Anchor
-            if post and nums:
-                for num in nums[:2]:
-                    p_anchor = (post, num)
-                    if p_anchor in self.post_num_to_targets:
-                        for tid_idx in self.post_num_to_targets[p_anchor]:
-                            scores[tid_idx] += 75.0
-                            
-            # Channel 6: Address Anchors: (num, locality)
-            if nums and awords:
-                for num in nums[:2]:
-                    for w in awords[:3]:
-                        anchor = (num, w)
-                        if anchor in self.addr_anchor_to_targets:
-                            for tid_idx in self.addr_anchor_to_targets[anchor]:
-                                scores[tid_idx] += 45.0
-                                
-            # Channel 7: (num, brand_tok)
-            if nums and ntoks:
-                primary_brand = ntoks[0]
-                for num in nums[:2]:
-                    nbrand = (num, primary_brand)
-                    if nbrand in self.num_brand_to_targets:
-                        for tid_idx in self.num_brand_to_targets[nbrand]:
-                            scores[tid_idx] += 60.0
-                            
-            if not scores:
-                candidates_map[qid] = []
+def key_ints(channels, strs):
+    """(channel list, string list) -> int64 keys."""
+    if len(strs) == 0:
+        return np.zeros(0, np.int64)
+    h = pl.Series(strs, dtype=pl.String).hash(seed=0).to_numpy().astype(np.uint64, copy=False)
+    low = (h & np.uint64(MASK36)).astype(np.int64)
+    return low | (np.asarray(channels, dtype=np.int64) << HASH_BITS)
+
+
+def sig_key_ints(channel, sig_hashes):
+    """Signature hash (uint64, 0 = absent) -> int64 key for channel R/C."""
+    low = (sig_hashes & np.uint64(MASK36)).astype(np.int64)
+    return low | (np.int64(channel) << HASH_BITS)
+
+
+class HashIndex:
+    def __init__(self, ukeys, indptr, postings, source, n_records):
+        self.ukeys = ukeys
+        self.indptr = indptr
+        self.postings = postings
+        self.source = source
+        self.n = n_records
+        self.nu = len(ukeys)
+        self.acc = np.zeros(n_records, np.float32)
+
+    @classmethod
+    def build(cls, key_batches, n_records, source, exclude=None, consume=False):
+        """key_batches: list of (keys int64, first_record, per-record key counts).
+        exclude: bool mask of records to skip. consume=True pops batches as they are packed
+        (frees memory progressively; the caller's list ends up empty)."""
+        assert n_records < MAX_RECS, "universe too large for 23-bit record ids"
+        parts = []
+        batches = key_batches if consume else list(key_batches)
+        while batches:
+            keys, off, kc = batches.pop(0)
+            recs = np.repeat(np.arange(off, off + kc.size, dtype=np.int64), kc)
+            if exclude is not None and recs.size:
+                m = ~exclude[recs]
+                keys, recs = keys[m], recs[m]
+            parts.append((keys.astype(np.int64) << REC_BITS) | recs)
+            del keys, recs
+        packed = np.concatenate(parts) if parts else np.zeros(0, np.int64)
+        del parts
+        packed.sort()
+        if packed.size:
+            keep = np.empty(packed.size, bool)
+            keep[0] = True
+            np.not_equal(packed[1:], packed[:-1], out=keep[1:])
+            if not keep.all():
+                packed = packed[keep]
+            del keep
+        if packed.size == 0:
+            return cls(np.zeros(0, np.int64), np.zeros(1, np.int64), np.zeros(0, np.int32),
+                       source, n_records)
+        keys = packed >> REC_BITS
+        recs = (packed & (MAX_RECS - 1)).astype(np.int32)
+        del packed
+        brk = np.empty(keys.size, bool)
+        brk[0] = True
+        np.not_equal(keys[1:], keys[:-1], out=brk[1:])
+        starts = np.flatnonzero(brk)
+        del brk
+        ukeys = keys[starts]
+        del keys
+        lengths = np.diff(np.append(starts, recs.size)).astype(np.int64)
+        del starts
+        ch = ukeys >> HASH_BITS
+        keep_run = lengths <= CH_BUILD_CAP[ch]
+        if not keep_run.all():
+            recs = recs[np.repeat(keep_run, lengths)]
+            ukeys = ukeys[keep_run]
+            lengths = lengths[keep_run]
+        indptr = np.zeros(ukeys.size + 1, np.int64)
+        np.cumsum(lengths, out=indptr[1:])
+        return cls(ukeys, indptr, recs, source, n_records)
+
+    def stats(self):
+        return {"keys": int(self.nu), "postings": int(self.postings.size),
+                "mb": (self.ukeys.nbytes + self.indptr.nbytes + self.postings.nbytes) / 1e6}
+
+    def _weights(self, ch, df):
+        base = CH_BASE[ch]
+        mode = CH_MODE[ch]
+        dff = df.astype(np.float64)
+        w = np.where(mode == 0, base / (dff + 10.0),
+                     np.where(mode == 1, base, base * np.minimum(1.0, 5.0 / np.maximum(dff, 1.0))))
+        w[df > CH_QUERY_CAP[ch]] = 0.0
+        tmask = ch == CH_T
+        if tmask.any() and not (w[tmask] > 0).any():
+            ti = np.flatnonzero(tmask)
+            j = ti[np.argmin(df[ti])]
+            if df[j] <= T_FALLBACK_CAP:
+                w[j] = 100.0 / (df[j] + 10.0)
+        return w
+
+    def query(self, qk, k):
+        """One query's index-form keys -> (targets int32, scores float32, ranks int16), top-k per source."""
+        empty = (np.zeros(0, np.int32), np.zeros(0, np.float32), np.zeros(0, np.int16))
+        if qk.size == 0 or self.nu == 0:
+            return empty
+        ch = qk >> HASH_BITS
+        is_a, is_s = ch == CH_A, ch == CH_S
+        if is_a.any() or is_s.any():  # acronym <-> short-name cross lookup
+            qk = qk.copy()
+            low = qk & MASK36
+            qk[is_a] = low[is_a] | (CH_S << HASH_BITS)
+            qk[is_s] = low[is_s] | (CH_A << HASH_BITS)
+        pos = np.searchsorted(self.ukeys, qk)
+        ok = pos < self.nu
+        pos = np.where(ok, pos, 0)
+        ok &= self.ukeys[pos] == qk
+        if not ok.any():
+            return empty
+        pos = pos[ok]
+        chq = qk[ok] >> HASH_BITS
+        s = self.indptr[pos]
+        e = self.indptr[pos + 1]
+        w = self._weights(chq, e - s)
+        sel = np.flatnonzero(w > 0)
+        if sel.size == 0:
+            return empty
+        acc, post = self.acc, self.postings
+        parts = []
+        for i in sel:
+            seg = post[s[i]:e[i]]
+            acc[seg] += w[i]
+            parts.append(seg)
+        touched = np.concatenate(parts)
+        ktot = 2 * k
+        if touched.size <= 4096:
+            u = np.unique(touched)
+        else:
+            m = 16 * ktot
+            if m < touched.size:
+                part = np.argpartition(-acc[touched], m)[:m]
+                u = np.unique(touched[part])
+                if u.size < ktot:
+                    u = np.unique(touched)
             else:
-                top_targets = [self.target_ids[idx] for idx, _ in scores.most_common(self.max_candidates)]
-                candidates_map[qid] = top_targets
-                
-        return candidates_map
+                u = np.unique(touched)
+        sc = acc[u]
+        acc[touched] = 0.0
+        src = self.source[u]
+        outs_t, outs_s, outs_r = [], [], []
+        for sv in np.unique(src):
+            msk = src == sv
+            us, ss = u[msk], sc[msk]
+            if us.size > k:
+                top = np.argpartition(-ss, k - 1)[:k]
+                us, ss = us[top], ss[top]
+            order = np.lexsort((us, -ss))
+            outs_t.append(us[order].astype(np.int32))
+            outs_s.append(ss[order].astype(np.float32))
+            outs_r.append(np.arange(order.size, dtype=np.int16))
+        if len(outs_t) == 1:
+            return outs_t[0], outs_s[0], outs_r[0]
+        return np.concatenate(outs_t), np.concatenate(outs_s), np.concatenate(outs_r)
+
+    def query_many(self, key_ptr, key_arr, rows, k):
+        """rows: iterable of query row ids (into key_ptr). -> (qrow, t, score, rank) arrays."""
+        qs, ts, ss, rs = [], [], [], []
+        for r in rows:
+            t, s, rk = self.query(key_arr[key_ptr[r]:key_ptr[r + 1]], k)
+            if t.size:
+                qs.append(np.full(t.size, r, np.int32))
+                ts.append(t)
+                ss.append(s)
+                rs.append(rk)
+        if not qs:
+            return (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32),
+                    np.zeros(0, np.int16))
+        return np.concatenate(qs), np.concatenate(ts), np.concatenate(ss), np.concatenate(rs)
