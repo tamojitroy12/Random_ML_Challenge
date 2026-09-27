@@ -145,7 +145,7 @@ def country_worker(args, P, c):
         raise SystemExit(f"thresholds file missing: {P['thr']} (run train_evaluate.py first)")
     lex = lexmod.load_lexicon(P["lex"])
     normalizer.set_lexicon(lex)
-    k = int(args.k or model.meta.get("k_infer", 25))
+    k = int(args.k or model.meta.get("k_infer", 35))
     wd = os.path.join(P["work"], safe_name(c))
     os.makedirs(wd, exist_ok=True)
 

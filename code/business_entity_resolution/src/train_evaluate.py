@@ -42,7 +42,7 @@ from src.runtime import (Timer, atomic_savez, atomic_write_json, fmt_secs, load_
                          read_json, setup_console, sha1_file)
 
 TRAIN_COUNTRIES = ["US", "India"]
-K_LIST = (5, 10, 15, 20, 25)
+K_LIST = (5, 10, 15, 20, 25, 30, 35)
 DENSE_RE = {
     "US": r"(?i)(^|,)\s*(vt|vermont|wy|wyoming|de|delaware)\s*(,|$)",
     "India": r"(?i)(^|,)\s*(kerala|keralam|kl|punjab|pb|കേരളം|ਪੰਜਾਬ)\s*(,|$)",
@@ -432,9 +432,9 @@ def _choose_k(P):
         for K in K_LIST:
             rec.setdefault(K, []).append(st.get("recall_val", {}).get(f"all@{K}", 0.0))
     avg = {K: float(np.mean(v)) for K, v in rec.items()}
-    k = 25
-    for K in (15, 20, 25):
-        if avg.get(25, 0) - avg.get(K, 0) <= 0.001:
+    k = 35
+    for K in (20, 25, 30, 35):
+        if avg.get(35, 0) - avg.get(K, 0) <= 0.001:
             k = K
             break
     return k, avg
@@ -661,7 +661,7 @@ def main():
     ap.add_argument("--n-train", type=int, default=None)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--chunk", type=int, default=None)
-    ap.add_argument("--k", type=int, default=25)
+    ap.add_argument("--k", type=int, default=35)
     ap.add_argument("--fresh", action="store_true")
     args = ap.parse_args()
     if args.n_train is None:

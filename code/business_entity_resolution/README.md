@@ -20,14 +20,15 @@ Links every Source 1 business to **all** of its Source 2 / Source 3 records. The
      - Alias markers are handled (`X dba Y` → `Y`), as are dotted initialisms, a global legal-form class table, honorifics, leetspeak and domains.
      - Synthetic garbage names are detected.
      - Indic scripts are transliterated with inherent-vowel handling, plus a native→Latin lexicon learned from the training ground truth (`lexicon.py`).
-2. **Blocking** (`blocking.py`). A compact CSR inverted index over hashed keys in 13 channels:
-   - name tokens, prefixes, phonetic skeletons and 3-grams;
+2. **Blocking** (`blocking.py`). A compact CSR inverted index over hashed keys in 15 channels (top-K per source = 35):
+   - name tokens, prefixes, phonetic skeletons, 3-grams, and 4-gram shingles;
+   - distinctive name token pairs (bi-tokens) for high-IDF recall on empty/sparse addresses;
    - acronym↔short name;
    - house number × street/name;
    - number-free name × street and street × city;
    - verbatim and canonical address signatures.
 
-   Weights are IDF-style and capped by document frequency. It returns the top-K per source (S2/S3).
+   Weights are IDF-style and capped by document frequency. It returns the top-35 candidates per source (S2/S3).
 3. **Features** (`feature_extractor.py`). 71 pairwise features computed with `rapidfuzz.process.cpdist` (multithreaded) plus numpy. They cover:
    - house-number relations (exact / digit drop / substitution / compound prefix chain / last-part change / range);
    - street containment and legal-form conflicts;

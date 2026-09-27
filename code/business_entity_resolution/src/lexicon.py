@@ -26,7 +26,7 @@ def _latin_tok(t):
     return _RE_LAT.sub("", fold_ascii(t).lower())
 
 
-def build_lexicon(train_dir, exclude_ids, out_path, min_count=3, min_share=0.6, s1_limit=None):
+def build_lexicon(train_dir, exclude_ids, out_path, min_count=2, min_share=0.55, s1_limit=None):
     gt = read_tsv(os.path.join(train_dir, "train_ground_truth.tsv"),
                   columns=("source1_entity_id", "matched_entity_ids"))
     s1 = read_tsv(os.path.join(train_dir, "train_source1.tsv"),

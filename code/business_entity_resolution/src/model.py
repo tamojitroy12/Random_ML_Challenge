@@ -136,13 +136,22 @@ def assign(q, p_eff, best, margin, hn_rel, hn_h, st_h, core_set, n_q, tau, delta
     acc = base & (p_eff >= tau)
     with np.errstate(over="ignore"):
         if tau_lo is not None and tau_lo < tau:
-            cand = base & ~acc & (p_eff >= tau_lo) & (core_set >= 0.6) & (hn_h != 0)
-            anc = acc & (hn_h != 0)
-            if cand.any() and anc.any():
-                ka = np.unique(_k3(q[anc], hn_h[anc], st_h[anc]))
-                ci = np.flatnonzero(cand)
-                hit = np.isin(_k3(q[ci], hn_h[ci], st_h[ci]), ka)
-                acc[ci[hit]] = True
+            anc = acc
+            anc_q = np.unique(q[anc]) if anc.any() else np.zeros(0, np.int64)
+            # Case 1: Same house number hash (tolerates minor street variations)
+            c1 = base & ~acc & (p_eff >= tau_lo) & (core_set >= 0.55) & (hn_h != 0)
+            anc_hn = anc & (hn_h != 0)
+            if c1.any() and anc_hn.any():
+                k_anc_hn = np.unique(q[anc_hn].astype(np.uint64) * _P1 ^ hn_h[anc_hn].astype(np.uint64))
+                c1_idx = np.flatnonzero(c1)
+                hit_c1 = np.isin(q[c1_idx].astype(np.uint64) * _P1 ^ hn_h[c1_idx].astype(np.uint64), k_anc_hn)
+                acc[c1_idx[hit_c1]] = True
+
+            # Case 2: Non-numbered entities (hn_h == 0) with high brand similarity and no conflict
+            if anc_q.size:
+                c2 = base & ~acc & (p_eff >= tau_lo) & (core_set >= 0.75) & (hn_rel != HN_CONFLICT) & np.isin(q, anc_q)
+                if c2.any():
+                    acc[c2] = True
         if suppress:
             ex = acc & (hn_rel == HN_EXACT)
             if ex.any():

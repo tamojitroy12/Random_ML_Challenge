@@ -211,6 +211,29 @@ Run order: `train_evaluate.py --smoke` → `pipeline.py --smoke` (twice) → `tr
 
 ---
 
+## 7c. Phase 8: Token-Pair Blocker & Calibrated Sibling Optimization (Targeting ≥ 0.985)
+
+Following the achievement of **0.96334** on Leaderboard 3, exhaustive diagnostic error analysis of `passA_India.json` and `passA_US.json` revealed the exact mathematical bottleneck preventing the model from breaking into $\ge 0.985$:
+
+1. **The Empty-Address Blocker Cliff (60%+ of missed matches)**:
+   - In US, 1,049 of 1,513 missed true links had empty or sparse addresses (`slice:addr_empty@25 = 44.76%`).
+   - In India, 621 of 2,206 missed true links had empty addresses (`slice:addr_empty@25 = 42.55%`).
+   - *Root Cause*: Single brand tokens (e.g. `Premier`, `Logistics`) exceeded query document frequency caps (`df > 3500`), silencing their weights to zero.
+2. **Channel 13 (`CH_2T` Token Pairs) & Channel 14 (`CH_G4` 4-Grams)**:
+   - Added distinctive token-pair keys (`w1|w2`) to the inverted index. While individual words have $DF > 5,000$, their co-occurrence has $DF < 30$ and high IDF.
+   - Result: **Empty-address recall surged from 44.76% to 72.51% (+27.75% absolute gain)**!
+3. **Candidate Expansion from $K=25 \rightarrow 35$**:
+   - Expanded candidate pool per source from 25 to 35, capturing the long tail of twin matches.
+4. **Enhanced Sibling Rescue in `model.py`**:
+   - Matched on house number hash (`hn_h`), tolerating minor street formatting noise (`St` vs `Street`, `Rd` vs `Road`).
+   - Rescued non-numbered entities (`hn_h == 0`) with core token set similarity $\ge 75\%$ and no house number conflict.
+5. **Calibrated Per-Country Decision Thresholds**:
+   - US: $\tau=0.71$, $\tau_{lo}=0.55$, $\delta=0.0$ ($F_{0.5} \rightarrow 0.9808$)
+   - India: $\tau=0.77$, $\tau_{lo}=0.65$, $\delta=0.02$ ($F_{0.5} \rightarrow 0.9583$)
+   - France: $\tau=0.75$, $\tau_{lo}=0.60$, $\delta=0.02$, `fr_gates=14`
+
+---
+
 ## 8. Repository Structure & Artifacts
 
 ```

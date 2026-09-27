@@ -15,21 +15,21 @@ import polars as pl
 from .normalizer import GENERIC_NAME_WORDS, STREET_GENERIC
 
 # Channels
-CH_T, CH_P, CH_K, CH_G, CH_A, CH_S, CH_H, CH_N, CH_B, CH_X, CH_Y, CH_R, CH_C = range(13)
+CH_T, CH_P, CH_K, CH_G, CH_A, CH_S, CH_H, CH_N, CH_B, CH_X, CH_Y, CH_R, CH_C, CH_2T, CH_G4 = range(15)
 CHANNEL_NAMES = ["token", "prefix4", "skel5", "gram3", "acronym", "short", "hn_street", "num_word",
-                 "hn_tok0", "name_x_street", "street_x_city", "raw_sig", "clean_sig"]
+                 "hn_tok0", "name_x_street", "street_x_city", "raw_sig", "clean_sig", "tok_pair", "gram4"]
 HASH_BITS = 36
 MASK36 = (1 << HASH_BITS) - 1
 REC_BITS = 23
 MAX_RECS = 1 << REC_BITS
 
 # weight mode: 0 -> base/(df+10); 1 -> constant base; 2 -> base*min(1, 5/df)
-CH_BASE = np.array([120, 35, 50, 3, 120, 120, 150, 100, 150, 120, 60, 80, 70, 0, 0, 0], np.float64)
-CH_MODE = np.array([0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 1, 1, 1], np.int64)
+CH_BASE = np.array([120, 35, 50, 3, 120, 120, 150, 100, 150, 120, 60, 80, 70, 160, 15, 0], np.float64)
+CH_MODE = np.array([0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 1, 1], np.int64)
 CH_BUILD_CAP = np.array([20000, 2500, 3000, 2000, 500, 500, 1000, 1000, 1000, 1000, 1000, 200, 200,
-                         0, 0, 0], np.int64)
+                         3000, 3000, 0], np.int64)
 CH_QUERY_CAP = np.array([3500, 2500, 3000, 2000, 500, 500, 1000, 1000, 1000, 1000, 1000, 200, 200,
-                         0, 0, 0], np.int64)
+                         2500, 2500, 0], np.int64)
 T_FALLBACK_CAP = 20000
 
 
@@ -40,7 +40,7 @@ def _rare(tokens, generic, k):
 
 
 def make_keys(core, concat, skel, tok0, acr, short, street, loc, city, hn_d, digits):
-    """String blocking keys (channels T..Y). Signature channels are added by the caller."""
+    """String blocking keys (channels T..G4). Signature channels are added by the caller."""
     keys = []
     ctoks = [t for t in core.split() if len(t) >= 2]
     seen = set()
@@ -85,6 +85,25 @@ def make_keys(core, concat, skel, tok0, acr, short, street, loc, city, hn_d, dig
     cty = city or (ltoks[-1] if ltoks else "")
     if rs_street and cty:
         keys.append((CH_Y, f"{rs_street[0]}|{cty}"))
+
+    # Channel 13 (CH_2T): Distinctive Name Token Pairs (High IDF for empty/sparse addresses)
+    rn_pair = _rare(ctoks, GENERIC_NAME_WORDS, 4)
+    if len(rn_pair) >= 2:
+        for i in range(len(rn_pair)):
+            for j in range(i + 1, len(rn_pair)):
+                w1, w2 = (rn_pair[i], rn_pair[j]) if rn_pair[i] < rn_pair[j] else (rn_pair[j], rn_pair[i])
+                keys.append((CH_2T, f"{w1}|{w2}"))
+
+    # Channel 14 (CH_G4): Name character 4-gram shingles for single or short names
+    if len(concat) >= 5:
+        g4s = []
+        for i in range(len(concat) - 3):
+            g4 = concat[i:i + 4]
+            if g4 not in g4s:
+                g4s.append(g4)
+        for g4 in g4s[:8]:
+            keys.append((CH_G4, g4))
+
     return keys
 
 

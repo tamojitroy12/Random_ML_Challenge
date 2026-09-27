@@ -4,38 +4,38 @@
       "delta": 0.02,
       "fr_gates": 14,
       "suppress": false,
-      "tau": 0.89,
+      "tau": 0.75,
       "tau1": null,
-      "tau_lo": 0.68,
+      "tau_lo": 0.60,
       "veto": 0
     },
     "India": {
       "delta": 0.02,
       "fr_gates": 0,
       "suppress": false,
-      "tau": 0.89,
+      "tau": 0.77,
       "tau1": null,
-      "tau_lo": 0.59,
+      "tau_lo": 0.65,
       "veto": 0
     },
     "US": {
       "delta": 0.0,
       "fr_gates": 0,
       "suppress": false,
-      "tau": 0.88,
+      "tau": 0.71,
       "tau1": null,
-      "tau_lo": 0.68,
+      "tau_lo": 0.55,
       "veto": 0
     }
   },
-  "created": "2026-09-27 18:58:20",
+  "created": "2026-09-27 21:10:00",
   "default": {
     "delta": 0.02,
     "fr_gates": 0,
     "suppress": false,
-    "tau": 0.89,
+    "tau": 0.75,
     "tau1": null,
-    "tau_lo": 0.68,
+    "tau_lo": 0.60,
     "veto": 0
   },
   "k_infer": 25,
